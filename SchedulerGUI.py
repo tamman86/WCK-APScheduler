@@ -7,6 +7,7 @@ import os
 from datetime import datetime, timedelta, time
 import json
 import time as tm
+import folium
 
 # --- CONFIGURATION ---
 GEOCODE_CACHE_FILE = 'geocode_cache.json'
@@ -89,6 +90,60 @@ def run_geocoding_process(window, values):
         print(str(e))
 
 
+def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
+    print(f"Generating coverage map: {map_filename}")
+    try:
+        # Create dictionaries for quick coordinate lookup
+        supplier_coords = suppliers_df.set_index('Name')[['Lat', 'Long']].to_dict('index')
+        recipient_coords = recipients_df.set_index('Name')[['Latitude', 'Longitude']].to_dict('index')
+
+        # Calculate the center of the map to focus on the delivery area
+        all_lats = pd.concat([suppliers_df['Lat'], recipients_df['Latitude']]).dropna()
+        all_lons = pd.concat([suppliers_df['Long'], recipients_df['Longitude']]).dropna()
+
+        if all_lats.empty or all_lons.empty:
+            print("WARNING: Cannot generate map, no coordinates found.")
+            return
+
+        map_center = [all_lats.mean(), all_lons.mean()]
+        delivery_map = folium.Map(location=map_center, zoom_start=10)
+
+        # Add markers and lines for each delivery in the plan
+        for _, row in plan_df.iterrows():
+            supplier_name = row['Supplier']
+            recipient_name = row['Deliver_To_Recipient']
+
+            s_info = supplier_coords.get(supplier_name)
+            r_info = recipient_coords.get(recipient_name)
+
+            if s_info and r_info and pd.notna(s_info['Lat']) and pd.notna(r_info['Latitude']):
+                s_lat, s_lon = s_info['Lat'], s_info['Long']
+                r_lat, r_lon = r_info['Latitude'], r_info['Longitude']
+
+                # Add markers
+                folium.Marker(
+                    [s_lat, s_lon],
+                    popup=f"<b>Supplier:</b> {supplier_name}",
+                    icon=folium.Icon(color='blue', icon='truck', prefix='fa')
+                ).add_to(delivery_map)
+
+                folium.Marker(
+                    [r_lat, r_lon],
+                    popup=f"<b>Recipient:</b> {recipient_name}",
+                    icon=folium.Icon(color='green', icon='home')
+                ).add_to(delivery_map)
+
+                # Add connecting line
+                folium.PolyLine(
+                    locations=[[s_lat, s_lon], [r_lat, r_lon]],
+                    color='red', weight=2.5, opacity=0.8
+                ).add_to(delivery_map)
+
+        delivery_map.save(map_filename)
+        print("Map generation complete.")
+    except Exception as e:
+        print(f"An error occurred during map generation: {e}")
+
 # --- Main Optimization Process ---
 def start_full_process(window, values):
     try:
@@ -154,7 +209,6 @@ def start_full_process(window, values):
 
             all_results = []
 
-            # --- MODIFIED: Reduced batch sizes ---
             batch_size = 10
 
             for i in range(0, len(available_suppliers_df), batch_size):
@@ -184,7 +238,6 @@ def start_full_process(window, values):
                                     'TravelTime_Minutes': round(element['duration']['value'] / 60, 2)
                                 })
 
-                    # --- MODIFIED: Add a 1-second delay to avoid rate-limiting ---
                     tm.sleep(1)
 
             print("\nProcessing travel data and intelligently updating stable cache file...\n")
@@ -265,6 +318,11 @@ def start_full_process(window, values):
 
             print("\n--- PROCESS COMPLETE ---")
             print(f"The schedule has been saved successfully to the '{plan_sheet_name}' sheet.")
+
+            print("\nStep 5: Generating delivery coverage map...")
+            map_filename = f"DeliveryMap_{days_ahead}-Day.html"
+            create_delivery_map(plan_df, available_suppliers_df, recipients_df, map_filename)
+            print("\n--- PROCESS COMPLETE ---")
         else:
             print("\n--- PROCESS FAILED ---")
             print("Could not find an optimal solution. Check if total supply can meet total demand.")
@@ -274,7 +332,6 @@ def start_full_process(window, values):
         print(str(e))
 
 
-# --- MODIFIED: GUI Layout with API Key Field ---
 sg.theme("SystemDefault")
 
 api_key_frame = [
