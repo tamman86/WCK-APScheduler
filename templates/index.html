@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<body>
+  <h1>WCK Delivery Scheduler</h1>
+  <form action="/run" method="post" enctype="multipart/form-data">
+    <p>API Key: <input type="password" name="api_key"></p>
+    <p>Data File: <input type="file" name="data_file"></p>
+    <p>Days Ahead: <input type="number" name="days_ahead" value="1" min="1" max="3"></p>
+    <input type="submit" value="Generate Schedule">
+  </form>
+</body>
+</html>

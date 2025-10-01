@@ -1,0 +1,9 @@
+flask
+gunicorn
+redis
+rq
+pandas
+openpyxl
+googlemaps
+pulp
+folium
