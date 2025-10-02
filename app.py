@@ -75,17 +75,20 @@ def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
         print(f"Map generation failed: {e}")
 
 
-# --- BACKGROUND JOBS ---
-def run_geocoding_job(excel_path, api_key, job_id):
+# --- THE COMBINED BACKGROUND JOB ---
+def run_combined_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
     """
-    This function now correctly adds Latitude/Longitude columns to the uploaded Excel file.
+    Performs the entire workflow: geocodes missing addresses, calculates optimal routes,
+    and generates the final schedule and map.
     """
     global job_results
-    job_results[job_id] = {'status': 'running', 'log': 'Starting Geocoding Process...\n'}
+    job_results[job_id] = {'status': 'running'}
     try:
+        # --- PART 1: GEOCODING LOGIC ---
+        print("Starting Part 1: Geocoding...")
         recipients_df = pd.read_excel(excel_path, sheet_name="Recipients")
         geocode_cache = load_geocode_cache()
-        new_coords_added = False
+        new_coords_added_to_cache = False
         file_was_modified = False
 
         if 'Latitude' not in recipients_df.columns: recipients_df['Latitude'] = None
@@ -95,62 +98,40 @@ def run_geocoding_job(excel_path, api_key, job_id):
         for index, row in recipients_df.iterrows():
             if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
                 address = row['Full Address']
-                lat, lng = None, None
-
                 if not isinstance(address, str) or address.strip() == '': continue
+
+                lat, lng = None, None
                 if address in geocode_cache:
-                    job_results[job_id]['log'] += f"CACHE HIT: Found '{address}'\n"
-                    lat = geocode_cache[address]['lat']
-                    lng = geocode_cache[address]['lng']
+                    lat, lng = geocode_cache[address]['lat'], geocode_cache[address]['lng']
                 else:
-                    job_results[job_id]['log'] += f"API CALL: Geocoding '{address}'...\n"
                     geocode_result = gmaps.geocode(address)
                     if geocode_result:
                         location = geocode_result[0]['geometry']['location']
                         lat, lng = location['lat'], location['lng']
                         geocode_cache[address] = {'lat': lat, 'lng': lng}
-                        new_coords_added = True
+                        new_coords_added_to_cache = True
                     else:
-                        job_results[job_id]['log'] += f"WARNING: Could not geocode '{address}'\n"
+                        print(f"WARNING: Could not geocode '{address}'")
 
                 if lat is not None and lng is not None:
-                    recipients_df.at[index, 'Latitude'] = lat
-                    recipients_df.at[index, 'Longitude'] = lng
+                    recipients_df.at[index, 'Latitude'], recipients_df.at[index, 'Longitude'] = lat, lng
                     file_was_modified = True
 
-        # Save the JSON cache file only if new API calls were made
-        if new_coords_added:
-            save_geocode_cache(geocode_cache)
+        if new_coords_added_to_cache: save_geocode_cache(geocode_cache)
 
-        # Save the Excel file only if any coordinates were filled in
         if file_was_modified:
-            job_results[job_id]['log'] += "Saving updated coordinates back to Excel file...\n"
+            print("Geocoding complete. Updating Excel file in place...")
             with pd.ExcelFile(excel_path) as xls:
                 all_sheets = {sheet_name: xls.parse(sheet_name) for sheet_name in xls.sheet_names}
             all_sheets['Recipients'] = recipients_df
             with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                for sheet_name, df in all_sheets.items():
-                    df.to_excel(writer, sheet_name=sheet_name, index=False)
-            job_results[job_id]['status'] = 'finished'
-            job_results[job_id]['result'] = {
-                'message': "Success! The uploaded file was updated with new coordinates. You can now run the scheduler."}
+                for sheet_name, df_sheet in all_sheets.items():
+                    df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
         else:
-            job_results[job_id]['log'] += "No new addresses found to geocode. File was not changed.\n"
-            job_results[job_id]['status'] = 'finished'
-            job_results[job_id]['result'] = {
-                'message': "No new coordinates needed. Your file already has all data."}
+            print("No new addresses needed geocoding.")
 
-    except Exception as e:
-        print("--- GEOCODING JOB FAILED: FULL TRACEBACK ---")
-        traceback.print_exc()
-        print("---------------------------------------------")
-        job_results[job_id]['status'] = 'failed'
-        job_results[job_id]['result'] = {'error': str(e)}
-
-def run_optimization_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
-    global job_results
-    job_results[job_id] = {'status': 'running'}
-    try:
+        # --- PART 2: OPTIMIZATION LOGIC ---
+        print("\nStarting Part 2: Optimization...")
         today = datetime.now()
         future_date = today + timedelta(days=days_ahead)
         departure_datetime = datetime.combine(future_date.date(), time(11, 0))
@@ -166,6 +147,7 @@ def run_optimization_job(excel_path, api_key, days_ahead, use_stable_cache, job_
         output_map_path = os.path.join('outputs', f"{timestamp}_Map.html")
 
         suppliers_df = pd.read_excel(excel_path, sheet_name="Suppliers")
+        # Reread the recipients_df from the (now updated) file
         recipients_df = pd.read_excel(excel_path, sheet_name="Recipients")
         available_suppliers_df = suppliers_df[
             suppliers_df['Availability'].str.contains(day_filter_str, na=False)].copy()
@@ -180,9 +162,7 @@ def run_optimization_job(excel_path, api_key, days_ahead, use_stable_cache, job_
                 raise ValueError(
                     f"Cache file '{STABLE_COSTS_FILE}' not found. Please run once in normal mode to create it.")
         else:
-            gmaps = googlemaps.Client(key=api_key)
             all_recipient_coords = list(zip(recipients_df['Latitude'], recipients_df['Longitude']))
-            # CORRECTED: Standardized to Latitude/Longitude
             all_supplier_coords = list(zip(available_suppliers_df['Latitude'], available_suppliers_df['Longitude']))
             all_results = []
             batch_size = 10
@@ -265,7 +245,6 @@ def run_optimization_job(excel_path, api_key, days_ahead, use_stable_cache, job_
         job_results[job_id]['status'] = 'failed'
         job_results[job_id]['result'] = {'error': str(e)}
 
-
 # --- FLASK APP INITIALIZATION ---
 app = Flask(__name__)
 app.config.from_object(Config())
@@ -285,23 +264,9 @@ job_results = {}
 def index():
     return render_template('index.html')
 
-
-@app.route('/run_geocode', methods=['POST'])
-def run_geocode_task():
-    if 'data_file' not in request.files or request.files['data_file'].filename == '':
-        return "Error: No file selected.", 400
-    file = request.files['data_file']
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    file.save(filepath)
-    api_key = request.form['api_key']
-    job_id = str(uuid.uuid4())
-    job_results[job_id] = {'status': 'queued'}
-    scheduler.add_job(id=job_id, func=run_geocoding_job, trigger='date', args=[filepath, api_key, job_id])
-    return redirect(url_for('results_geocode', job_id=job_id))
-
-
 @app.route('/run', methods=['POST'])
 def run_task():
+    # This is now the only "run" route
     if 'data_file' not in request.files or request.files['data_file'].filename == '':
         return "Error: No file selected.", 400
     file = request.files['data_file']
@@ -312,15 +277,12 @@ def run_task():
     use_stable_cache = 'use_cache' in request.form
     job_id = str(uuid.uuid4())
     job_results[job_id] = {'status': 'queued'}
-    scheduler.add_job(id=job_id, func=run_optimization_job, trigger='date',
+
+    # Schedule the new combined job
+    scheduler.add_job(id=job_id, func=run_combined_job, trigger='date',
                       args=[filepath, api_key, days_ahead, use_stable_cache, job_id])
+
     return redirect(url_for('results', job_id=job_id))
-
-
-@app.route('/results_geocode/<job_id>')
-def results_geocode(job_id):
-    return render_template('results_geocode.html', job_id=job_id)
-
 
 @app.route('/results/<job_id>')
 def results(job_id):

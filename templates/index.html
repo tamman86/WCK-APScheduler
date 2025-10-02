@@ -3,26 +3,9 @@
 <head>
     <meta charset="UTF-8">
     <title>WCK Delivery Scheduler</title>
-    <style>
-        body { font-family: sans-serif; margin: 2em; }
-        hr { margin: 2em 0; }
-        input[type=submit] { font-size: 1.1em; padding: 0.5em 1em; }
-    </style>
 </head>
 <body>
     <h1>WCK Delivery Scheduler</h1>
-    
-    <hr>
-    <h2>1. Pre-Process Addresses</h2>
-    <form action="/run_geocode" method="post" enctype="multipart/form-data">
-        <p><em>Run this first, or anytime you add new recipients to your Excel file.</em></p>
-        <p>Google Maps API Key: <input type="password" name="api_key" required></p>
-        <p>Data File: <input type="file" name="data_file" required></p>
-        <input type="submit" value="Geocode New Addresses">
-    </form>
-    <hr>
-
-    <h2>2. Generate Schedule</h2>
     <form action="/run" method="post" enctype="multipart/form-data">
         <p>Google Maps API Key: <input type="password" name="api_key" required></p>
         <p>Data File: <input type="file" name="data_file" required></p>
@@ -30,6 +13,5 @@
         <p><input type="checkbox" name="use_cache" value="true"> Use Stable Travel Times (from cache)</p>
         <input type="submit" value="Generate Schedule">
     </form>
-
 </body>
 </html>
