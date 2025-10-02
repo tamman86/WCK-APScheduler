@@ -8,31 +8,17 @@ import traceback
 import pandas as pd
 import googlemaps
 import folium
+import zipfile
 from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus, COIN_CMD
 from flask import Flask, request, render_template, redirect, url_for, jsonify, send_from_directory
 from flask_apscheduler import APScheduler
 
 # --- CONFIGURATION ---
-GEOCODE_CACHE_FILE = 'geocode_cache.json'
-STABLE_COSTS_FILE = 'stable_travel_costs.csv'
-
-
 class Config:
     SCHEDULER_API_ENABLED = True
 
 
 # --- HELPER FUNCTIONS ---
-def load_geocode_cache():
-    try:
-        with open(GEOCODE_CACHE_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-def save_geocode_cache(cache_data):
-    with open(GEOCODE_CACHE_FILE, 'w') as f:
-        json.dump(cache_data, f, indent=4)
-
 def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
     """Generates an interactive HTML map of the delivery routes with unique supplier colors."""
     try:
@@ -76,21 +62,30 @@ def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
 
 
 # --- THE COMBINED BACKGROUND JOB ---
-def run_combined_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
+def run_combined_job(job_id, api_key, days_ahead, use_stable_cache, excel_path, geocode_cache_path=None,
+                     stable_costs_path=None):
     """
-    Performs the entire workflow: geocodes missing addresses, calculates optimal routes,
-    and generates the final schedule and map.
+    Performs the entire workflow with manual cache management and zips all outputs.
     """
     global job_results
     job_results[job_id] = {'status': 'running'}
     try:
+        # Create a unique directory for this job's output files to prevent collisions
+        timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        job_output_dir = os.path.join('outputs', job_id)
+        os.makedirs(job_output_dir, exist_ok=True)
+
         # --- PART 1: GEOCODING LOGIC ---
         print("Starting Part 1: Geocoding...")
         recipients_df = pd.read_excel(excel_path, sheet_name="Recipients")
-        geocode_cache = load_geocode_cache()
-        new_coords_added_to_cache = False
-        file_was_modified = False
 
+        # Load cache from uploaded file if it exists, otherwise start fresh
+        geocode_cache = {}
+        if geocode_cache_path:
+            with open(geocode_cache_path, 'r') as f:
+                geocode_cache = json.load(f)
+
+        new_coords_added_to_cache = False
         if 'Latitude' not in recipients_df.columns: recipients_df['Latitude'] = None
         if 'Longitude' not in recipients_df.columns: recipients_df['Longitude'] = None
 
@@ -115,20 +110,8 @@ def run_combined_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
 
                 if lat is not None and lng is not None:
                     recipients_df.at[index, 'Latitude'], recipients_df.at[index, 'Longitude'] = lat, lng
-                    file_was_modified = True
 
-        if new_coords_added_to_cache: save_geocode_cache(geocode_cache)
-
-        if file_was_modified:
-            print("Geocoding complete. Updating Excel file in place...")
-            with pd.ExcelFile(excel_path) as xls:
-                all_sheets = {sheet_name: xls.parse(sheet_name) for sheet_name in xls.sheet_names}
-            all_sheets['Recipients'] = recipients_df
-            with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
-                for sheet_name, df_sheet in all_sheets.items():
-                    df_sheet.to_excel(writer, sheet_name=sheet_name, index=False)
-        else:
-            print("No new addresses needed geocoding.")
+        # The 'recipients_df' DataFrame is now updated in memory with all coordinates.
 
         # --- PART 2: OPTIMIZATION LOGIC ---
         print("\nStarting Part 2: Optimization...")
@@ -140,28 +123,22 @@ def run_combined_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
         day_full_name = future_date.strftime('%A')
         formatted_date = future_date.strftime('%Y-%m-%d')
         sheet_title = f"Delivery Schedule for {day_full_name}, {formatted_date}"
-
-        timestamp = today.strftime('%Y%m%d-%H%M%S')
         plan_sheet_name = f"DeliveryPlan_{days_ahead}-Day"
-        output_excel_path = os.path.join('outputs', f"{timestamp}_Schedule.xlsx")
-        output_map_path = os.path.join('outputs', f"{timestamp}_Map.html")
 
         suppliers_df = pd.read_excel(excel_path, sheet_name="Suppliers")
-        # Reread the recipients_df from the (now updated) file
-        recipients_df = pd.read_excel(excel_path, sheet_name="Recipients")
         available_suppliers_df = suppliers_df[
             suppliers_df['Availability'].str.contains(day_filter_str, na=False)].copy()
 
         if available_suppliers_df.empty:
             raise ValueError(f"No suppliers found with availability for '{day_filter_str}'.")
 
-        if use_stable_cache:
-            try:
-                cost_df = pd.read_csv(STABLE_COSTS_FILE)
-            except FileNotFoundError:
-                raise ValueError(
-                    f"Cache file '{STABLE_COSTS_FILE}' not found. Please run once in normal mode to create it.")
+        if use_stable_cache and stable_costs_path:
+            print("Using provided stable travel costs file.")
+            cost_df = pd.read_csv(stable_costs_path)
+            # The final cache df is the one we just loaded
+            final_cache_df = cost_df
         else:
+            print("Fetching new travel times from Google Maps API...")
             all_recipient_coords = list(zip(recipients_df['Latitude'], recipients_df['Longitude']))
             all_supplier_coords = list(zip(available_suppliers_df['Latitude'], available_suppliers_df['Longitude']))
             all_results = []
@@ -185,54 +162,77 @@ def run_combined_job(excel_path, api_key, days_ahead, use_stable_cache, job_id):
                     tm.sleep(1)
 
             new_cost_df = pd.DataFrame(all_results)
-            try:
-                cached_cost_df = pd.read_csv(STABLE_COSTS_FILE)
-                merged_df = pd.merge(new_cost_df, cached_cost_df, on=['Supplier', 'Recipient'], how='left',
-                                     suffixes=('_new', '_cached'))
+            cost_df = new_cost_df  # Use the fresh data for this optimization run
 
-                def get_best_time(row):
-                    if pd.notna(row['TravelTime_Minutes_cached']):
-                        return min(row['TravelTime_Minutes_new'], row['TravelTime_Minutes_cached'])
-                    else:
-                        return row['TravelTime_Minutes_new']
+            # Intelligently merge with uploaded cache if it exists
+            final_cache_df = new_cost_df
+            if stable_costs_path:
+                try:
+                    cached_cost_df = pd.read_csv(stable_costs_path)
+                    merged_df = pd.merge(new_cost_df, cached_cost_df, on=['Supplier', 'Recipient'], how='left',
+                                         suffixes=('_new', '_cached'))
 
-                merged_df['TravelTime_Minutes'] = merged_df.apply(get_best_time, axis=1)
-                final_cache_df = merged_df[['Supplier', 'Recipient', 'TravelTime_Minutes']]
-            except FileNotFoundError:
-                final_cache_df = new_cost_df
+                    def get_best_time(row):
+                        if pd.notna(row['TravelTime_Minutes_cached']):
+                            return min(row['TravelTime_Minutes_new'], row['TravelTime_Minutes_cached'])
+                        else:
+                            return row['TravelTime_Minutes_new']
 
-            final_cache_df.to_csv(STABLE_COSTS_FILE, index=False)
-            cost_df = new_cost_df
+                    merged_df['TravelTime_Minutes'] = merged_df.apply(get_best_time, axis=1)
+                    final_cache_df = merged_df[['Supplier', 'Recipient', 'TravelTime_Minutes']]
+                except Exception as e:
+                    print(f"Could not merge with stable costs cache: {e}")
 
+        # --- The rest of the optimization logic ---
         recipients_df['Standard Meal'] = recipients_df['Standard Meal'].fillna(0).astype(int)
         available_suppliers_df['Capacity'] = available_suppliers_df['Capacity'].fillna(0).astype(int)
-
         suppliers = available_suppliers_df['Name'].tolist()
         recipients = recipients_df['Name'].tolist()
         supply = pd.Series(available_suppliers_df.Capacity.values, index=available_suppliers_df.Name).to_dict()
         demand = pd.Series(recipients_df['Standard Meal'].values, index=recipients_df.Name).to_dict()
         costs = cost_df.set_index(['Supplier', 'Recipient'])['TravelTime_Minutes'].to_dict()
         costs = {s: {r: costs.get((s, r), 99999) for r in recipients} for s in suppliers}
-
         model = LpProblem(name="Meal-Delivery-Optimization", sense=LpMinimize)
         routes = LpVariable.dicts("Route", (suppliers, recipients), lowBound=0, cat='Integer')
         model += lpSum([routes[s][r] * costs[s][r] for s in suppliers for r in recipients]), "Total_Travel_Cost"
         for s in suppliers: model += lpSum([routes[s][r] for r in recipients]) <= supply[s], f"Supply_{s}"
         for r in recipients: model += lpSum([routes[s][r] for s in suppliers]) == demand[r], f"Demand_{r}"
-
         model.solve(None)
 
         if LpStatus[model.status] == 'Optimal':
+            # --- PART 3: ZIPPING THE OUTPUTS ---
+            print("\nStarting Part 3: Generating and Zipping Outputs...")
             delivery_plan = [{'Supplier': s, 'Deliver_To_Recipient': r, 'NumberOfMeals': int(routes[s][r].varValue)} for
                              s in suppliers for r in recipients if routes[s][r].varValue > 0]
             plan_df = pd.DataFrame(delivery_plan)
 
+            # Define output paths inside the unique job directory
+            output_excel_path = os.path.join(job_output_dir, f"{timestamp}_Schedule.xlsx")
+            output_map_path = os.path.join(job_output_dir, f"{timestamp}_Map.html")
+            updated_geocode_cache_path = os.path.join(job_output_dir, 'geocode_cache.json')
+            updated_stable_costs_path = os.path.join(job_output_dir, 'stable_travel_costs.csv')
+
+            # Save all individual files
             with pd.ExcelWriter(output_excel_path, engine='openpyxl') as writer:
                 plan_df.to_excel(writer, sheet_name=plan_sheet_name, index=False)
-
             create_delivery_map(plan_df, available_suppliers_df, recipients_df, output_map_path)
+            with open(updated_geocode_cache_path, 'w') as f:
+                json.dump(geocode_cache, f, indent=4)
+            if 'final_cache_df' in locals():
+                final_cache_df.to_csv(updated_stable_costs_path, index=False)
 
-            result = {'excel_path': output_excel_path, 'map_path': output_map_path}
+            # Create the final zip file
+            zip_filename = f"{timestamp}_delivery_package.zip"
+            zip_filepath = os.path.join('outputs', zip_filename)
+            with zipfile.ZipFile(zip_filepath, 'w') as zipf:
+                zipf.write(output_excel_path, os.path.basename(output_excel_path))
+                zipf.write(output_map_path, os.path.basename(output_map_path))
+                zipf.write(updated_geocode_cache_path, 'geocode_cache.json')
+                if os.path.exists(updated_stable_costs_path):
+                    zipf.write(updated_stable_costs_path, 'stable_travel_costs.csv')
+
+            # Set the final result for the user
+            result = {'zip_path': zip_filepath}
             job_results[job_id]['status'] = 'finished'
             job_results[job_id]['result'] = result
         else:
@@ -265,22 +265,42 @@ def index():
     return render_template('index.html')
 
 @app.route('/run', methods=['POST'])
+@app.route('/run', methods=['POST'])
 def run_task():
-    # This is now the only "run" route
-    if 'data_file' not in request.files or request.files['data_file'].filename == '':
-        return "Error: No file selected.", 400
-    file = request.files['data_file']
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    file.save(filepath)
+    # Create a unique directory for this job's uploaded files
+    job_id = str(uuid.uuid4())
+    job_upload_dir = os.path.join(app.config['UPLOAD_FOLDER'], job_id)
+    os.makedirs(job_upload_dir, exist_ok=True)
+
+    # --- Handle multiple file uploads ---
+    excel_file = request.files['data_file']
+    geocode_file = request.files.get('geocode_cache_file')
+    stable_costs_file = request.files.get('stable_costs_file')
+
+    if excel_file.filename == '': return "Error: No data file selected.", 400
+
+    excel_path = os.path.join(job_upload_dir, excel_file.filename)
+    excel_file.save(excel_path)
+
+    geocode_cache_path = None
+    if geocode_file and geocode_file.filename != '':
+        geocode_cache_path = os.path.join(job_upload_dir, geocode_file.filename)
+        geocode_file.save(geocode_cache_path)
+
+    stable_costs_path = None
+    if stable_costs_file and stable_costs_file.filename != '':
+        stable_costs_path = os.path.join(job_upload_dir, stable_costs_file.filename)
+        stable_costs_file.save(stable_costs_path)
+
     api_key = request.form['api_key']
     days_ahead = int(request.form['days_ahead'])
     use_stable_cache = 'use_cache' in request.form
-    job_id = str(uuid.uuid4())
+
     job_results[job_id] = {'status': 'queued'}
 
-    # Schedule the new combined job
     scheduler.add_job(id=job_id, func=run_combined_job, trigger='date',
-                      args=[filepath, api_key, days_ahead, use_stable_cache, job_id])
+                      args=[job_id, api_key, days_ahead, use_stable_cache, excel_path, geocode_cache_path,
+                            stable_costs_path])
 
     return redirect(url_for('results', job_id=job_id))
 

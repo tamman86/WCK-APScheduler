@@ -7,11 +7,19 @@
 <body>
     <h1>WCK Delivery Scheduler</h1>
     <form action="/run" method="post" enctype="multipart/form-data">
+        <h3>Required Inputs</h3>
         <p>Google Maps API Key: <input type="password" name="api_key" required></p>
-        <p>Data File: <input type="file" name="data_file" required></p>
+        <p>Data File (Excel): <input type="file" name="data_file" required></p>
         <p>Days Ahead: <input type="number" name="days_ahead" value="1" min="1" max="3"></p>
-        <p><input type="checkbox" name="use_cache" value="true"> Use Stable Travel Times (from cache)</p>
-        <input type="submit" value="Generate Schedule">
+        
+        <hr>
+        <h3>Optional Inputs (for Caching)</h3>
+        <p><input type="checkbox" name="use_cache" value="true"> Use Stable Travel Times (if file is provided)</p>
+        <p>Geocode Cache File (Optional): <input type="file" name="geocode_cache_file"></p>
+        <p>Stable Travel Costs File (Optional): <input type="file" name="stable_costs_file"></p>
+        
+        <hr>
+        <input type="submit" value="Generate Schedule Package">
     </form>
 </body>
 </html>
