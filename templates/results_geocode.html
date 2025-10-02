@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Geocoding...</title>
+</head>
+<body>
+  <h1>Processing Addresses...</h1>
+  <div id="status">Please wait...</div>
+  <div id="result"></div>
+  <div id="log" style="white-space: pre-wrap; background-color: #f4f4f4; border: 1px solid #ccc; padding: 10px; margin-top: 20px; max-height: 300px; overflow-y: auto;"></div>
+
+  <script>
+    const jobId = "{{ job_id }}";
+    function checkStatus() {
+      fetch(`/status/${jobId}`)
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('status').innerText = `Job Status: ${data.status}`;
+          if (data.log) { document.getElementById('log').innerText = data.log; }
+          if (data.status === 'finished') {
+            document.getElementById('result').innerHTML = `<p><strong>${data.result.message}</strong></p><br><a href="/">Go Back to Main Page</a>`;
+          } else if (data.status === 'failed') {
+            document.getElementById('result').innerHTML = `<p>Error: ${data.result.error}</p><br><a href="/">Go Back to Main Page</a>`;
+          } else {
+            setTimeout(checkStatus, 3000);
+          }
+        });
+    }
+    checkStatus();
+  </script>
+</body>
+</html>
