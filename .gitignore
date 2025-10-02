@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDE folders
+.idea/
+.vscode/
+
+# App-generated files
+*.json
+*.csv
+*.html
+*.zip
+uploads/
+outputs/
