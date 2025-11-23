@@ -1,12 +1,17 @@
-import FreeSimpleGUI as sg
+import customtkinter as ctk
+import tkinter as tk
+from tkinter import filedialog
+import threading
+import sys
+import os
+import json
+import time as tm
+from datetime import datetime, timedelta, time
+
+# --- YOUR LOGIC IMPORTS ---
 import pandas as pd
 import googlemaps
 from pulp import LpProblem, LpMinimize, LpVariable, lpSum, LpStatus, COIN_CMD
-import sys
-import os
-from datetime import datetime, timedelta, time
-import json
-import time as tm
 import folium
 
 # --- CONFIGURATION ---
@@ -14,9 +19,8 @@ GEOCODE_CACHE_FILE = 'geocode_cache.json'
 STABLE_COSTS_FILE = 'stable_travel_costs.csv'
 
 
-# The hardcoded API_KEY variable has been removed from here.
+# --- LOGIC FUNCTIONS ---
 
-# --- Geocoding Cache Helper Functions ---
 def load_geocode_cache():
     try:
         with open(GEOCODE_CACHE_FILE, 'r') as f:
@@ -30,92 +34,22 @@ def save_geocode_cache(cache_data):
         json.dump(cache_data, f, indent=4)
 
 
-# --- Main Geocoding Process ---
-def run_geocoding_process(window, values):
-    print("--- Starting Geocoding Pre-Process ---")
-    excel_path = values['-FILE_PATH-']
-    api_key = values['-API_KEY-']  # Get API key from GUI
-
-    if not api_key:
-        print("ERROR: Please enter your Google Maps API key.\n")
-        return
-    if not excel_path:
-        print("ERROR: Please select a data file first.\n")
-        return
-
+def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename, log_func):
+    log_func(f"Generating coverage map: {map_filename}")
     try:
-        df = pd.read_excel(excel_path, sheet_name="Recipients")
-        geocode_cache = load_geocode_cache()
-        new_coords_added = False
-
-        if 'Latitude' not in df.columns: df['Latitude'] = None
-        if 'Longitude' not in df.columns: df['Longitude'] = None
-
-        gmaps = googlemaps.Client(key=api_key)  # Use key from GUI
-
-        for index, row in df.iterrows():
-            if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
-                address = row['Full Address']
-                if not isinstance(address, str) or address.strip() == '': continue
-
-                if address in geocode_cache:
-                    print(f"CACHE HIT: Found coordinates for '{address}'")
-                    lat, lng = geocode_cache[address]['lat'], geocode_cache[address]['lng']
-                else:
-                    print(f"API CALL: Geocoding new address '{address}'...")
-                    geocode_result = gmaps.geocode(address)
-                    if geocode_result:
-                        location = geocode_result[0]['geometry']['location']
-                        lat, lng = location['lat'], location['lng']
-                        geocode_cache[address] = {'lat': lat, 'lng': lng}
-                        new_coords_added = True
-                    else:
-                        print(f"WARNING: Could not geocode '{address}'")
-                        lat, lng = None, None
-
-                df.at[index, 'Latitude'] = lat
-                df.at[index, 'Longitude'] = lng
-
-        if new_coords_added:
-            save_geocode_cache(geocode_cache)
-            print("Saving updated coordinates back to the 'Recipients' sheet...")
-            with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-                df.to_excel(writer, sheet_name="Recipients", index=False)
-        else:
-            print("No new addresses found to geocode.")
-
-        print("--- Geocoding Pre-Process Complete ---\n")
-    except Exception as e:
-        print(f"\n--- AN ERROR OCCURRED DURING GEOCODING ---")
-        print(str(e))
-
-
-
-
-
-
-
-
-
-def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
-    print(f"Generating coverage map: {map_filename}")
-    try:
-        # Create dictionaries for quick coordinate lookup
         supplier_coords = suppliers_df.set_index('Name')[['Lat', 'Long']].to_dict('index')
         recipient_coords = recipients_df.set_index('Name')[['Latitude', 'Longitude']].to_dict('index')
 
-        # Calculate the center of the map to focus on the delivery area
         all_lats = pd.concat([suppliers_df['Lat'], recipients_df['Latitude']]).dropna()
         all_lons = pd.concat([suppliers_df['Long'], recipients_df['Longitude']]).dropna()
 
         if all_lats.empty or all_lons.empty:
-            print("WARNING: Cannot generate map, no coordinates found.")
+            log_func("WARNING: Cannot generate map, no coordinates found.")
             return
 
         map_center = [all_lats.mean(), all_lons.mean()]
         delivery_map = folium.Map(location=map_center, zoom_start=10)
 
-        # Add markers and lines for each delivery in the plan
         for _, row in plan_df.iterrows():
             supplier_name = row['Supplier']
             recipient_name = row['Deliver_To_Recipient']
@@ -127,53 +61,93 @@ def create_delivery_map(plan_df, suppliers_df, recipients_df, map_filename):
                 s_lat, s_lon = s_info['Lat'], s_info['Long']
                 r_lat, r_lon = r_info['Latitude'], r_info['Longitude']
 
-                # Add markers
-                folium.Marker(
-                    [s_lat, s_lon],
-                    popup=f"<b>Supplier:</b> {supplier_name}",
-                    icon=folium.Icon(color='blue', icon='truck', prefix='fa')
-                ).add_to(delivery_map)
-
-                folium.Marker(
-                    [r_lat, r_lon],
-                    popup=f"<b>Recipient:</b> {recipient_name}",
-                    icon=folium.Icon(color='green', icon='home')
-                ).add_to(delivery_map)
-
-                # Add connecting line
-                folium.PolyLine(
-                    locations=[[s_lat, s_lon], [r_lat, r_lon]],
-                    color='red', weight=2.5, opacity=0.8
-                ).add_to(delivery_map)
+                folium.Marker([s_lat, s_lon], popup=f"Supplier: {supplier_name}",
+                              icon=folium.Icon(color='blue', icon='truck', prefix='fa')).add_to(delivery_map)
+                folium.Marker([r_lat, r_lon], popup=f"Recipient: {recipient_name}",
+                              icon=folium.Icon(color='green', icon='home')).add_to(delivery_map)
+                folium.PolyLine(locations=[[s_lat, s_lon], [r_lat, r_lon]], color='red', weight=2.5,
+                                opacity=0.8).add_to(delivery_map)
 
         delivery_map.save(map_filename)
-        print("Map generation complete.")
+        log_func("Map generation complete.")
     except Exception as e:
-        print(f"An error occurred during map generation: {e}")
+        log_func(f"An error occurred during map generation: {e}")
 
-# --- Main Optimization Process ---
-def start_full_process(window, values):
+
+def run_geocoding_logic(values, log_func):
+    log_func("--- Starting Geocoding Pre-Process ---")
+    excel_path = values['file_path']
+    api_key = values['api_key']
+
+    if not api_key:
+        log_func("ERROR: Please enter your Google Maps API key.\n")
+        return
+    if not excel_path:
+        log_func("ERROR: Please select a data file first.\n")
+        return
+
     try:
-        excel_path = values['-FILE_PATH-']
-        use_stable_cache = values['-USE_CACHE-']
-        api_key = values['-API_KEY-']
+        df = pd.read_excel(excel_path, sheet_name="Recipients")
+        geocode_cache = load_geocode_cache()
+        new_coords_added = False
+
+        if 'Latitude' not in df.columns: df['Latitude'] = None
+        if 'Longitude' not in df.columns: df['Longitude'] = None
+
+        gmaps = googlemaps.Client(key=api_key)
+
+        for index, row in df.iterrows():
+            if pd.isna(row['Latitude']) or pd.isna(row['Longitude']):
+                address = row['Full Address']
+                if not isinstance(address, str) or address.strip() == '': continue
+
+                if address in geocode_cache:
+                    log_func(f"CACHE HIT: Found coordinates for '{address}'")
+                    lat, lng = geocode_cache[address]['lat'], geocode_cache[address]['lng']
+                else:
+                    log_func(f"API CALL: Geocoding new address '{address}'...")
+                    geocode_result = gmaps.geocode(address)
+                    if geocode_result:
+                        location = geocode_result[0]['geometry']['location']
+                        lat, lng = location['lat'], location['lng']
+                        geocode_cache[address] = {'lat': lat, 'lng': lng}
+                        new_coords_added = True
+                    else:
+                        log_func(f"WARNING: Could not geocode '{address}'")
+                        lat, lng = None, None
+
+                df.at[index, 'Latitude'] = lat
+                df.at[index, 'Longitude'] = lng
+
+        if new_coords_added:
+            save_geocode_cache(geocode_cache)
+            log_func("Saving updated coordinates back to the 'Recipients' sheet...")
+            with pd.ExcelWriter(excel_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+                df.to_excel(writer, sheet_name="Recipients", index=False)
+        else:
+            log_func("No new addresses found to geocode.")
+
+        log_func("--- Geocoding Pre-Process Complete ---\n")
+    except Exception as e:
+        log_func(f"\n--- AN ERROR OCCURRED DURING GEOCODING ---")
+        log_func(str(e))
+
+
+def run_optimization_logic(values, log_func):
+    try:
+        excel_path = values['file_path']
+        use_stable_cache = values['use_cache']
+        api_key = values['api_key']
+        days_ahead = int(values['days_ahead'])
 
         if not api_key:
-            print("ERROR: Please enter your Google Maps API key.\n")
+            log_func("ERROR: Please enter your Google Maps API key.\n")
             return
-
-        try:
-            days_ahead = int(values['-DAYS_AHEAD-'])
-            if not 1 <= days_ahead <= 3: raise ValueError("Days Ahead must be between 1 and 3.")
-        except ValueError as e:
-            print(f"ERROR: Invalid 'Days Ahead' value. {e}\n")
-            return
-
         if not excel_path:
-            print("ERROR: Please select a data file first.\n")
+            log_func("ERROR: Please select a data file first.\n")
             return
 
-        print("--- Starting Optimization Process ---\n")
+        log_func("--- Starting Optimization Process ---\n")
 
         today = datetime.now()
         future_date = today + timedelta(days=days_ahead)
@@ -184,7 +158,7 @@ def start_full_process(window, values):
         formatted_date = future_date.strftime('%Y-%m-%d')
         sheet_title = f"Delivery Schedule for {day_full_name}, {formatted_date}"
 
-        print(f"Forecasting for {days_ahead}-day(s) ahead: {day_full_name}")
+        log_func(f"Forecasting for {days_ahead}-day(s) ahead: {day_full_name}")
 
         suppliers_df = pd.read_excel(excel_path, sheet_name="Suppliers")
         recipients_df = pd.read_excel(excel_path, sheet_name="Recipients")
@@ -192,42 +166,38 @@ def start_full_process(window, values):
         available_suppliers_df = suppliers_df[
             suppliers_df['Availability'].str.contains(day_filter_str, na=False)].copy()
         if available_suppliers_df.empty:
-            print(f"ERROR: No suppliers found with availability for '{day_filter_str}'.\n")
+            log_func(f"ERROR: No suppliers found with availability for '{day_filter_str}'.\n")
             return
 
-        print(f"Found {len(available_suppliers_df)} available suppliers and {len(recipients_df)} recipients.\n")
+        log_func(f"Found {len(available_suppliers_df)} available suppliers and {len(recipients_df)} recipients.\n")
+
+        cost_df = None
 
         if use_stable_cache:
-            print("Step 2: Using stable travel times from cache file...")
+            log_func("Step 2: Using stable travel times from cache file...")
             try:
                 cost_df = pd.read_csv(STABLE_COSTS_FILE)
-                print("Successfully loaded travel times from cache.\n")
+                log_func("Successfully loaded travel times from cache.\n")
             except FileNotFoundError:
-                print(
-                    f"ERROR: Cache file '{STABLE_COSTS_FILE}' not found. Please run once in normal mode to create it.\n")
+                log_func(f"ERROR: Cache file '{STABLE_COSTS_FILE}' not found. Run once in normal mode first.\n")
                 return
         else:
-            print(
-                f"Step 2: Requesting predictive travel data in batches for {departure_datetime.strftime('%Y-%m-%d %I:%M %p')}...")
+            log_func(
+                f"Step 2: Requesting predictive travel data for {departure_datetime.strftime('%Y-%m-%d %I:%M %p')}...")
             gmaps = googlemaps.Client(key=api_key)
-
             all_recipient_coords = list(zip(recipients_df['Latitude'], recipients_df['Longitude']))
             all_supplier_coords = list(zip(available_suppliers_df['Lat'], available_suppliers_df['Long']))
-
             all_results = []
-
             batch_size = 10
 
             for i in range(0, len(available_suppliers_df), batch_size):
                 supplier_batch_df = available_suppliers_df.iloc[i:i + batch_size]
                 supplier_batch_coords = all_supplier_coords[i:i + batch_size]
-
                 for j in range(0, len(recipients_df), batch_size):
                     recipient_batch_df = recipients_df.iloc[j:j + batch_size]
                     recipient_batch_coords = all_recipient_coords[j:j + batch_size]
 
-                    print(
-                        f"  - Processing supplier batch {i // batch_size + 1} vs recipient batch {j // batch_size + 1}...")
+                    log_func(f"  - Processing batch S:{i // batch_size + 1} vs R:{j // batch_size + 1}...")
 
                     matrix_result = gmaps.distance_matrix(
                         origins=supplier_batch_coords,
@@ -244,12 +214,12 @@ def start_full_process(window, values):
                                     'Recipient': recipient_batch_df.iloc[recipient_idx]['Name'],
                                     'TravelTime_Minutes': round(element['duration']['value'] / 60, 2)
                                 })
-
                     tm.sleep(1)
 
-            print("\nProcessing travel data and intelligently updating stable cache file...\n")
+            log_func("\nProcessing travel data and updating stable cache file...\n")
             new_cost_df = pd.DataFrame(all_results)
 
+            # Cache merging logic
             try:
                 cached_cost_df = pd.read_csv(STABLE_COSTS_FILE)
                 merged_df = pd.merge(new_cost_df, cached_cost_df, on=['Supplier', 'Recipient'], how='left',
@@ -258,21 +228,20 @@ def start_full_process(window, values):
                 def get_best_time(row):
                     if pd.notna(row['TravelTime_Minutes_cached']):
                         return min(row['TravelTime_Minutes_new'], row['TravelTime_Minutes_cached'])
-                    else:
-                        return row['TravelTime_Minutes_new']
+                    return row['TravelTime_Minutes_new']
 
                 merged_df['TravelTime_Minutes'] = merged_df.apply(get_best_time, axis=1)
                 cost_df = new_cost_df
                 final_cache_df = merged_df[['Supplier', 'Recipient', 'TravelTime_Minutes']]
             except FileNotFoundError:
-                print("No existing cache file found. Creating a new one.")
+                log_func("No existing cache file found. Creating a new one.")
                 cost_df = new_cost_df
                 final_cache_df = new_cost_df
 
             final_cache_df.to_csv(STABLE_COSTS_FILE, index=False)
-            print("Stable travel cost file has been updated with the best available times.")
+            log_func("Stable travel cost file updated.")
 
-        print("Step 3: Formulating and solving the optimization problem...")
+        log_func("Step 3: Formulating optimization problem...")
         recipients_df['Standard Meal'] = recipients_df['Standard Meal'].fillna(0).astype(int)
         available_suppliers_df['Capacity'] = available_suppliers_df['Capacity'].fillna(0).astype(int)
 
@@ -289,15 +258,12 @@ def start_full_process(window, values):
         for s in suppliers: model += lpSum([routes[s][r] for r in recipients]) <= supply[s], f"Supply_{s}"
         for r in recipients: model += lpSum([routes[s][r] for s in suppliers]) == demand[r], f"Demand_{r}"
 
+        # Solver Path Logic
         solver = None
-        # Check if running as a PyInstaller bundle
         if getattr(sys, 'frozen', False):
-            # If bundled, the path is to the temporary folder _MEIPASS
             solver_path = os.path.join(sys._MEIPASS, 'cbc.exe')
             solver = COIN_CMD(path=solver_path)
         else:
-            # If running as a normal .py script, PuLP's default is fine on Windows
-            # but we still check for the Mac case
             if sys.platform == "darwin":
                 if os.path.exists('/opt/homebrew/bin/cbc'):
                     solver = COIN_CMD(path='/opt/homebrew/bin/cbc')
@@ -305,14 +271,14 @@ def start_full_process(window, values):
                     solver = COIN_CMD(path='/usr/local/bin/cbc')
 
         model.solve(solver)
-        print(f"Solver status: {LpStatus[model.status]}\n")
+        log_func(f"Solver status: {LpStatus[model.status]}\n")
 
         if LpStatus[model.status] == 'Optimal':
             plan_sheet_name = f"DeliveryPlan_{days_ahead}-Day"
-            print(f"Step 4: Optimal solution found! Saving to '{plan_sheet_name}' sheet...")
+            log_func(f"Step 4: Optimal solution found! Saving to '{plan_sheet_name}'...")
 
-            delivery_plan = [{'Supplier': s, 'Deliver_To_Recipient': r, 'NumberOfMeals': int(routes[s][r].varValue)} for
-                             s in suppliers for r in recipients if routes[s][r].varValue > 0]
+            delivery_plan = [{'Supplier': s, 'Deliver_To_Recipient': r, 'NumberOfMeals': int(routes[s][r].varValue)}
+                             for s in suppliers for r in recipients if routes[s][r].varValue > 0]
             plan_df = pd.DataFrame(delivery_plan)
 
             title_df = pd.DataFrame([sheet_title] + [None] * (len(plan_df.columns) - 1)).T
@@ -323,59 +289,158 @@ def start_full_process(window, values):
                 final_df.to_excel(writer, sheet_name=plan_sheet_name, index=False, header=[None] * len(plan_df.columns))
                 plan_df.to_excel(writer, sheet_name=plan_sheet_name, startrow=2, index=False)
 
-            print("\n--- PROCESS COMPLETE ---")
-            print(f"The schedule has been saved successfully to the '{plan_sheet_name}' sheet.")
+            log_func(f"Schedule saved to '{plan_sheet_name}'.")
 
-            print("\nStep 5: Generating delivery coverage map...")
+            log_func("\nStep 5: Generating delivery coverage map...")
             map_filename = f"DeliveryMap_{days_ahead}-Day.html"
-            create_delivery_map(plan_df, available_suppliers_df, recipients_df, map_filename)
-            print("\n--- PROCESS COMPLETE ---")
+            create_delivery_map(plan_df, available_suppliers_df, recipients_df, map_filename, log_func)
+            log_func("\n--- PROCESS COMPLETE ---")
         else:
-            print("\n--- PROCESS FAILED ---")
-            print("Could not find an optimal solution. Check if total supply can meet total demand.")
+            log_func("\n--- PROCESS FAILED ---")
+            log_func("Could not find optimal solution. Check supply vs demand.")
 
     except Exception as e:
-        print(f"\n--- AN ERROR OCCURRED DURING OPTIMIZATION ---")
-        print(str(e))
+        log_func(f"\n--- AN ERROR OCCURRED DURING OPTIMIZATION ---")
+        log_func(str(e))
 
 
-sg.theme("SystemDefault")
+# --- GUI CLASS ---
 
-api_key_frame = [
-    sg.Text("Google Maps API Key:"),
-    sg.Input(key='-API_KEY-', password_char='*', expand_x=True)
-]
+ctk.set_appearance_mode("Dark")  # Modes: "System" (standard), "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Themes: "blue" (standard), "green", "dark-blue"
 
-layout = [
-    [sg.Frame("API Configuration", [api_key_frame], expand_x=True)],
-    [sg.Frame("1. Select Data File", [[sg.Text("Data File:"), sg.Input(key='-FILE_PATH-', readonly=True, expand_x=True),
-                                       sg.FileBrowse(file_types=(("Excel Files", "*.xlsx"),))]], expand_x=True)],
-    [sg.Frame("2. Pre-Process Addresses (Run if you add new recipients)",
-              [[sg.Button("Geocode New Addresses", key='-GEOCODE-', expand_x=True)]], expand_x=True)],
-    [sg.Frame("3. Configure and Run Scheduler", [
-        [sg.Text("Days Ahead:"), sg.Input(default_text='1', key='-DAYS_AHEAD-', size=(3, 1)),
-         sg.Text("(1=Tomorrow [Max 3])"),
-         sg.Checkbox('Use Stable Travel Times (from cache)', default=False, key='-USE_CACHE-')]], expand_x=True)],
-    [sg.Button("Optimize Schedule", key='-OPTIMIZE-', expand_x=True, pad=(0, 10))],
-    [sg.Frame("Process Log", [[sg.Output(size=(80, 20), key='-LOG-')]], expand_x=True, expand_y=True)]
-]
 
-window = sg.Window("WCK Delivery Scheduler", layout, resizable=True)
+class SchedulerApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
 
-while True:
-    event, values = window.read()
-    if event == sg.WIN_CLOSED: break
+        self.title("WCK Delivery Scheduler")
+        self.geometry("850x650")
 
-    if event == '-GEOCODE-':
-        window[event].update(disabled=True)
-        window.perform_long_operation(lambda: run_geocoding_process(window, values), '-GEOCODE_COMPLETE-')
+        # Layout config
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # Log area expands
 
-    elif event == '-OPTIMIZE-':
-        window[event].update(disabled=True)
-        window.perform_long_operation(lambda: start_full_process(window, values), '-OPTIMIZE_COMPLETE-')
+        self.setup_ui()
 
-    elif event in ('-GEOCODE_COMPLETE-', '-OPTIMIZE_COMPLETE-'):
-        button_key = event.split('_')[0] + '-'
-        window[button_key].update(disabled=False)
+    def setup_ui(self):
+        # --- 1. Configuration Frame ---
+        self.config_frame = ctk.CTkFrame(self)
+        self.config_frame.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="ew")
+        self.config_frame.grid_columnconfigure(1, weight=1)
 
-window.close()
+        # API Key
+        ctk.CTkLabel(self.config_frame, text="Google Maps API Key:").grid(row=0, column=0, padx=10, pady=10, sticky="w")
+        self.api_entry = ctk.CTkEntry(self.config_frame, show="*", placeholder_text="Enter API Key here")
+        self.api_entry.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+
+        # File Selection
+        ctk.CTkLabel(self.config_frame, text="Data File (Excel):").grid(row=1, column=0, padx=10, pady=10, sticky="w")
+        self.file_entry = ctk.CTkEntry(self.config_frame, placeholder_text="No file selected")
+        self.file_entry.grid(row=1, column=1, padx=10, pady=10, sticky="ew")
+
+        self.browse_btn = ctk.CTkButton(self.config_frame, text="Browse", command=self.browse_file, width=100)
+        self.browse_btn.grid(row=1, column=2, padx=10, pady=10)
+
+        # --- 2. Action Frame ---
+        self.action_frame = ctk.CTkFrame(self)
+        self.action_frame.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        self.action_frame.grid_columnconfigure((0, 1), weight=1)
+
+        # Left Side: Geocoding
+        self.geo_frame = ctk.CTkFrame(self.action_frame)
+        self.geo_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+
+        ctk.CTkLabel(self.geo_frame, text="Pre-Process Addresses", font=("Roboto", 14, "bold")).pack(pady=(10, 5))
+        ctk.CTkLabel(self.geo_frame, text="(Run if adding new recipients)").pack(pady=(0, 10))
+        self.geo_btn = ctk.CTkButton(self.geo_frame, text="Geocode New Addresses", fg_color="transparent",
+                                     border_width=2, command=self.start_geocode_thread)
+        self.geo_btn.pack(pady=10, padx=20, fill="x")
+
+        # Right Side: Optimization
+        self.opt_frame = ctk.CTkFrame(self.action_frame)
+        self.opt_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
+
+        ctk.CTkLabel(self.opt_frame, text="Run Scheduler", font=("Roboto", 14, "bold")).pack(pady=(10, 5))
+
+        # Controls row
+        self.ctrl_inner = ctk.CTkFrame(self.opt_frame, fg_color="transparent")
+        self.ctrl_inner.pack(pady=5)
+
+        ctk.CTkLabel(self.ctrl_inner, text="Days Ahead:").pack(side="left", padx=5)
+        self.days_entry = ctk.CTkEntry(self.ctrl_inner, width=40)
+        self.days_entry.insert(0, "1")
+        self.days_entry.pack(side="left", padx=5)
+
+        self.cache_chk = ctk.CTkCheckBox(self.ctrl_inner, text="Use Cached Travel Times")
+        self.cache_chk.pack(side="left", padx=15)
+
+        self.run_btn = ctk.CTkButton(self.opt_frame, text="Optimize Schedule", command=self.start_optimize_thread)
+        self.run_btn.pack(pady=10, padx=20, fill="x")
+
+        # --- 3. Logging Frame ---
+        self.log_frame = ctk.CTkFrame(self)
+        self.log_frame.grid(row=2, column=0, padx=20, pady=(10, 20), sticky="nsew")
+        self.log_frame.grid_columnconfigure(0, weight=1)
+        self.log_frame.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(self.log_frame, text="Process Log").grid(row=0, column=0, sticky="w", padx=10, pady=(5, 0))
+
+        self.log_box = ctk.CTkTextbox(self.log_frame, font=("Consolas", 12))
+        self.log_box.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
+        self.log_box.configure(state="disabled")  # Read-only initially
+
+    # --- Helper Functions ---
+    def browse_file(self):
+        filename = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
+        if filename:
+            self.file_entry.delete(0, "end")
+            self.file_entry.insert(0, filename)
+
+    def log(self, message):
+        # This function is thread-safe way to update GUI from background threads
+        self.after(0, self._append_log, message)
+
+    def _append_log(self, message):
+        self.log_box.configure(state="normal")
+        self.log_box.insert("end", str(message) + "\n")
+        self.log_box.see("end")
+        self.log_box.configure(state="disabled")
+
+    def get_current_values(self):
+        return {
+            'api_key': self.api_entry.get(),
+            'file_path': self.file_entry.get(),
+            'days_ahead': self.days_entry.get(),
+            'use_cache': bool(self.cache_chk.get())
+        }
+
+    def lock_ui(self, locking=True):
+        state = "disabled" if locking else "normal"
+        self.geo_btn.configure(state=state)
+        self.run_btn.configure(state=state)
+        self.browse_btn.configure(state=state)
+
+    # --- Threading Wrappers ---
+    def start_geocode_thread(self):
+        self.lock_ui(True)
+        threading.Thread(target=self._run_geocode, daemon=True).start()
+
+    def _run_geocode(self):
+        vals = self.get_current_values()
+        run_geocoding_logic(vals, self.log)
+        self.after(0, lambda: self.lock_ui(False))
+
+    def start_optimize_thread(self):
+        self.lock_ui(True)
+        threading.Thread(target=self._run_optimize, daemon=True).start()
+
+    def _run_optimize(self):
+        vals = self.get_current_values()
+        run_optimization_logic(vals, self.log)
+        self.after(0, lambda: self.lock_ui(False))
+
+
+if __name__ == "__main__":
+    app = SchedulerApp()
+    app.mainloop()
